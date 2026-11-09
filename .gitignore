@@ -2,4 +2,4 @@
 .vscode
 .claude
 .claudeignore
-*.md
+__pycache__/
