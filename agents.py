@@ -136,444 +136,478 @@ class RandomContextualAgent(ContextualAgent):
 # ---------------------------------------------------------------------------
 # Your agents
 # ---------------------------------------------------------------------------
+#
+# Everything below this line was written by our team (the provided code above
+# is unchanged). Notation follows Sutton & Barto, Chapter 2:
+#   Q(a)  estimated value (average catch) of spot a
+#   N(a)  number of times spot a has been chosen
+#   t     number of days already fished in the current season
+# Every random decision uses self.rng (seeded in the constructor), so a run
+# can be reproduced exactly by giving the same seed.
 
 
-def argmax_random_tie(values, rng):
-    """Index of the largest value, ties broken uniformly at random with rng.
+def _argmax_random_tie(values, rng):
+    """Index of the maximum of `values`, breaking ties uniformly at random.
 
-    np.argmax always returns the first maximum, which would bias every agent
-    towards spot 0 whenever estimates are equal (for example at the start).
+    Why: np.argmax always returns the FIRST maximum. With equal estimates (for
+    example at the start of a season, when every Q is the same) that would make
+    every agent always start at spot 0, which is an arbitrary bias.
     """
     values = np.asarray(values, dtype=float)
-    return int(rng.choice(np.flatnonzero(values == values.max())))
+    best = np.flatnonzero(values == values.max())
+    return int(rng.choice(best))
 
 
-def check_probability(name, value):
-    """Raise ValueError unless value is a number between 0 and 1 inclusive."""
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"{name} must be between 0 and 1, got {value}")
-
-
-def check_step_size(alpha):
-    """Raise ValueError unless alpha is None (sample average) or in (0, 1]."""
-    if alpha is not None and not 0.0 < alpha <= 1.0:
-        raise ValueError(f"alpha must be None or in (0, 1], got {alpha}")
-
-
-def incremental_update(q, n, spot, catch, alpha):
-    """Count a visit of spot and move its estimate q[spot] towards catch, in place.
-
-    The step is 1 / n[spot] (sample average, Section 2.4) when alpha is None,
-    otherwise the constant alpha (Section 2.5).
-    """
-    n[spot] += 1
-    step = 1.0 / n[spot] if alpha is None else alpha
-    q[spot] += step * (catch - q[spot])
+# ===========================================================================
+# Task 4 (part 1): human strategies from Part II, written as precise rules
+# ===========================================================================
+#
+# We abstracted two of our team's strategies into rules that can be applied to
+# any bay (see Description.txt). The third one (kanakara: always move to a
+# different spot) never exploits, so it behaves like RandomAgent and was not
+# worth coding again.
+#
+# Which one is "best"? We simulated both rules on 1000 random bays per season
+# and measured the fraction of the best possible catch they get (our Task 3
+# measure, see the README). kumarsh's rule wins in Seasons 1 and 3 and ties in
+# Season 2 (experiment.ipynb, section 1.1), so it is HumanRuleAgent;
+# bouazza's rule is kept as ThresholdRuleAgent for the comparison.
 
 
 class ThresholdRuleAgent(Agent):
-    """Soulaimen's strategy, from his strategy notes in the log "bouazza".
+    """Second human strategy (bouazza's threshold rule), kept to compare with HumanRuleAgent.
 
-    The notes, made precise. "Days since visited" of a spot is the number of
-    days fished since its last visit (a spot never visited counts from day 0).
+    The rule, precise enough to apply by hand. Every evening, after seeing
+    today's catch c at spot s, decide tomorrow's spot with the first line that
+    applies:
 
-    1. Day 1: fish at start_spot, Seagrass Bed (Season 1 note: "in the middle").
-    2. Stay while yesterday's catch is at least leave_below (Season 3 note:
-       "When I got less than 6kg I changed the spot and lasted in one spot when
-       it gave me more than 7kg"; this note leaves a spot only below 6 kg, so a
-       catch between 6 and 7 kg also keeps it. The Season 1 note says about
-       6.5 kg).
-    3. On a day it leaves, if another spot has not been visited for
-       forgotten_after days or more, test that spot, the longest forgotten one
-       first (Season 3 note: "spent much time not visiting one spot (for 8
-       days for example) and that I had to change the spot I'm actually in I
-       test this forgotten spot").
-    4. Otherwise move to the other spot with the best average catch so far. If
-       no other spot has been visited yet, move to the least recently visited
-       spot instead.
+    0. Day 1: fish at `start_spot` (2 = Seagrass Bed, "the middle of the bay").
+    1. Rapid search in progress: go to the next spot of the search list.
+    2. Hot spot (c > `high`, 7 kg): stay at s.
+    3. Collapse (c < `collapse`, 2 kg, at a spot whose recent average was
+       above `high`): the fish have probably moved (Season 3). Start a rapid
+       search: visit every other spot once, least recently visited first.
+    4. Forgotten spot (some spot not visited for `revisit_gap` = 8 days, or
+       never visited): test it, the one not visited for the longest time.
+    5. Bad day (c < `low`, 6 kg): move to the other spot with the best recent
+       average (average of its last `memory` = 3 catches).
+    6. Medium day (low <= c <= high): if today was a test of another spot, go
+       back to the spot with the best recent average; otherwise stay.
 
-    Ties are broken at random with self.rng.
+    Why a recent average (last 3 catches) and not the average of all catches:
+    it is what a human remembers, and it lets the rule forget the fish
+    populations of before the change in Season 3.
 
-    Memory: total catch and visits per spot, the day of each spot's last
-    visit, the current spot and yesterday's catch.
-    Parameters: start_spot, leave_below (kg), forgotten_after (days).
+    Parameters
+    ----------
+    low, high : float
+        Leave below `low` kg, stay above `high` kg (Rules 1 and 2 of the notes).
+    revisit_gap : int
+        Days after which an unvisited spot is tested again (Rule 3 of the notes).
+    collapse : float
+        A catch below this at a reliable spot triggers a rapid search (Rule 4).
+    memory : int
+        Number of recent catches averaged to judge a spot.
+    start_spot : int
+        Spot fished on day 1.
     """
 
-    def __init__(self, start_spot=2, leave_below=6.0, forgotten_after=8,
-                 n_spots=5, seed=None):
-        """Store the start spot, the leaving threshold (kg) and the day count.
-
-        Raises ValueError for a start spot out of range or a day count below 1.
-        """
+    def __init__(self, n_spots=5, seed=None, low=6.0, high=7.0, revisit_gap=8,
+                 collapse=2.0, memory=3, start_spot=2):
         super().__init__(n_spots, seed)
-        if not 0 <= start_spot < n_spots:
-            raise ValueError(f"start_spot must be between 0 and {n_spots - 1}")
-        if forgotten_after < 1:
-            raise ValueError("forgotten_after must be at least 1")
+        self.low, self.high = low, high
+        self.revisit_gap = revisit_gap
+        self.collapse = collapse
+        self.memory = memory
         self.start_spot = start_spot
-        self.leave_below = leave_below
-        self.forgotten_after = forgotten_after
 
     def reset(self):
-        """Forget every catch and visit of the previous season."""
-        self.day = 0
-        self.sums = np.zeros(self.n_spots)
-        self.counts = np.zeros(self.n_spots)
-        self.last_visit = np.zeros(self.n_spots)
-        self.current = None
-        self.last_catch = None
+        self.t = 0                                   # days fished so far
+        self.next_spot = self.start_spot             # decided the evening before
+        self.last_seen = np.full(self.n_spots, -10**9)  # day of last visit (never = far past)
+        self.recent = [[] for _ in range(self.n_spots)]  # last `memory` catches per spot
+        self.search = []                             # spots left to visit in a rapid search
+        self.home = self.start_spot                  # spot we were exploiting before a test
 
-    def _days_since_other_visits(self):
-        """Days fished since each spot's last visit, -inf for the current spot.
-
-        A spot never visited counts from day 0.
-        """
-        since = self.day - self.last_visit
-        since[self.current] = -np.inf
-        return since
+    def _recent_mean(self, spot):
+        """Average of the last catches at `spot` (+inf if never visited, so it gets tested)."""
+        r = self.recent[spot]
+        return np.mean(r) if r else np.inf
 
     def choose(self):
-        """Apply the rules in the order of the class docstring."""
-        if self.day == 0:
-            return self.start_spot
-        if self.last_catch >= self.leave_below:
-            return self.current
-        since = self._days_since_other_visits()
-        visited = self.counts > 0
-        visited[self.current] = False
-        if since.max() >= self.forgotten_after or not visited.any():
-            return argmax_random_tie(since, self.rng)
-        averages = np.where(visited, self.sums / np.maximum(self.counts, 1), -np.inf)
-        return argmax_random_tie(averages, self.rng)
+        return int(self.next_spot)
 
     def update(self, spot, catch):
-        """Record the catch and the day of this visit."""
-        self.day += 1
-        self.current = spot
-        self.sums[spot] += catch
-        self.counts[spot] += 1
-        self.last_visit[spot] = self.day
-        self.last_catch = catch
+        # Was today a test of a spot other than our current "home" spot?
+        was_test = spot != self.home
+        # Remember the reliability of this spot BEFORE adding today's catch
+        # (needed by Rule 3: was it a good spot until today?).
+        was_reliable = bool(self.recent[spot]) and np.mean(self.recent[spot]) > self.high
+
+        # --- memory update ---
+        self.recent[spot] = (self.recent[spot] + [catch])[-self.memory:]
+        self.last_seen[spot] = self.t
+        self.t += 1
+
+        others = [k for k in range(self.n_spots) if k != spot]
+        means = np.array([self._recent_mean(k) for k in range(self.n_spots)])
+        # Spots not visited for revisit_gap days (never-visited spots included)
+        forgotten = [k for k in others if self.t - self.last_seen[k] >= self.revisit_gap]
+
+        # --- the rule (first line that applies) ---
+        if self.search:                                         # 1. rapid search
+            nxt = self.search.pop(0)
+        elif catch > self.high:                                 # 2. hot spot: stay
+            nxt = spot
+        elif catch < self.collapse and was_reliable:            # 3. collapse
+            self.search = sorted(others, key=lambda k: self.last_seen[k])
+            nxt = self.search.pop(0)
+        elif forgotten:                                         # 4. test a forgotten spot
+            nxt = min(forgotten, key=lambda k: self.last_seen[k])
+        elif catch < self.low:                                  # 5. bad day: best other spot
+            nxt = max(others, key=lambda k: means[k])
+        elif was_test:                                          # 6a. medium test: go back to best
+            nxt = _argmax_random_tie(means, self.rng)
+        else:                                                   # 6b. medium day at home: stay
+            nxt = spot
+
+        # The "home" spot is the one we fish when we are not testing:
+        # a spot becomes home when we decide to stay at it.
+        if nxt == spot:
+            self.home = spot
+        elif not self.search and nxt not in forgotten:
+            self.home = nxt
+        self.next_spot = nxt
 
 
-class ExploreThenCommitAgent(Agent):
-    """Shubham's strategy, from his Season 1 and Season 2 notes in the log "kumarsh".
+class HumanRuleAgent(Agent):
+    """Task 4: the best human strategy of our team (kumarsh's "sample, then stick").
 
-    "I visited each location and identified the one that yielded the most
-    fish. Then, I tried to fish at the same spot multiple times." As a rule:
-    while some spot has fewer than explore_rounds visits, fish at the spot
-    with the fewest visits (the lowest spot number among equals, so a fresh
-    season goes 0, 1, 2, 3, 4). After that, every day fish at the spot with
-    the highest average catch so far, ties broken at random with self.rng.
+    The rule:
+    1. Days 1 to n_spots: fish each spot once (in a random order).
+    2. Afterwards: fish the spot with the best average catch so far
+       (average of ALL catches at that spot).
+    3. Except: if yesterday's catch was below `low` (5 kg), do not fish that
+       spot today; take the best of the other spots.
 
-    Memory: total catch and number of visits of each spot.
-    Parameter: explore_rounds, how many times each spot is tried first.
+    The "centre bias" of the original notes (prefer Seagrass Bed and Deep
+    Channel) was dropped: spot names carry no information in a random bay.
+
+    It is in fact "explore first, then greedy" (Section 2.2 with epsilon = 0
+    after one sample of each arm) plus a leave-on-bad-day rule.
     """
 
-    def __init__(self, explore_rounds=1, n_spots=5, seed=None):
-        """Store explore_rounds.
-
-        Raises ValueError if explore_rounds is below 1.
-        """
+    def __init__(self, n_spots=5, seed=None, low=5.0):
         super().__init__(n_spots, seed)
-        if explore_rounds < 1:
-            raise ValueError("explore_rounds must be at least 1")
-        self.explore_rounds = explore_rounds
+        self.low = low
 
     def reset(self):
-        """Forget the catches of the previous season."""
-        self.sums = np.zeros(self.n_spots)
-        self.counts = np.zeros(self.n_spots)
+        self.order = list(self.rng.permutation(self.n_spots))  # sampling phase order
+        self.sum = np.zeros(self.n_spots)
+        self.N = np.zeros(self.n_spots)
+        self.last = None                                         # (spot, catch) of yesterday
 
     def choose(self):
-        """The least visited spot during exploration, then the best average."""
-        if self.counts.min() < self.explore_rounds:
-            return int(np.argmin(self.counts))
-        return argmax_random_tie(self.sums / self.counts, self.rng)
+        if self.order:                                  # 1. sample every spot once
+            return int(self.order.pop(0))
+        means = self.sum / np.maximum(self.N, 1)        # 2. best average so far
+        if self.last is not None and self.last[1] < self.low:
+            means[self.last[0]] = -np.inf               # 3. not the spot that just failed
+        return _argmax_random_tie(means, self.rng)
 
     def update(self, spot, catch):
-        """Add the catch to the spot's total."""
-        self.sums[spot] += catch
-        self.counts[spot] += 1
+        self.sum[spot] += catch
+        self.N[spot] += 1
+        self.last = (spot, catch)
 
 
-class SweepAgent(Agent):
-    """Adhitya's strategy, from his Season 2 note in the log "kanakara" ("in a ordered way").
-
-    The Season 2 log is two sweeps: each block of 5 days visits every spot
-    once. As a rule: each day, fish at a spot not yet visited in the current
-    sweep, chosen uniformly at random with self.rng. Once every spot has been
-    visited, a new sweep starts. Catches are never used, so in expectation the
-    rule is as good as random choice.
-
-    Memory: the spots not yet visited in the current sweep. No parameters.
-    """
-
-    def reset(self):
-        """Start a new sweep with every spot still to visit."""
-        self.remaining = set(range(self.n_spots))
-
-    def choose(self):
-        """A random spot among those not yet visited in this sweep."""
-        return int(self.rng.choice(sorted(self.remaining)))
-
-    def update(self, spot, catch):
-        """Mark the spot as visited, and start a new sweep once all are visited."""
-        self.remaining.discard(spot)
-        if not self.remaining:
-            self.reset()
-
-
-class HumanRuleAgent(ExploreThenCommitAgent):
-    """Task 4: the best human strategy identified in Part II, written as a rule.
-
-    The rule (Shubham's notes): fish once at each spot, in the order Old Pier,
-    Rocky Point, Seagrass Bed, Deep Channel, Lighthouse Reef. From day 6 on,
-    every day fish at the spot whose catches so far have the highest average,
-    choosing at random between spots with exactly the same average.
-
-    It is ExploreThenCommitAgent with explore_rounds=1. Of the team's rules,
-    it has the lowest mean regret summed over the three seasons on 1000
-    random bays per season (experiment.ipynb, Part II). ThresholdRuleAgent is
-    better in Season 3 only.
-
-    Memory: total catch and number of visits of each spot. No parameters.
-    """
-
-    def __init__(self, n_spots=5, seed=None):
-        """One exploration round, as in the notes."""
-        super().__init__(explore_rounds=1, n_spots=n_spots, seed=seed)
-
-
-# Task 4: add below at least two agents implementing methods from the reading
-# (Sutton and Barto, Chapter 2), as subclasses of Agent. Document each class:
-# what it keeps in memory, how it chooses, what its parameters mean.
+# ===========================================================================
+# Task 4 (part 2): methods from Sutton & Barto, Sections 2.1 to 2.7
+# ===========================================================================
 
 
 class EpsilonGreedyAgent(Agent):
-    """Epsilon-greedy action-value method (Sutton and Barto, Sections 2.2 to 2.6).
+    """Epsilon-greedy action-value method (Sections 2.2 to 2.5).
 
-    Memory: an estimate Q of the average catch of each spot and the number of
-    visits N of each spot.
+    Memory: Q (estimated average catch of each spot) and N (visits per spot).
 
-    Choice: with probability epsilon a spot chosen uniformly at random,
-    otherwise the spot with the highest Q (ties broken at random).
+    Choice: with probability `epsilon`, a spot uniformly at random (explore);
+    otherwise the spot with the largest Q (exploit, ties broken at random).
 
-    Update after a catch R at spot s: Q[s] += step * (R - Q[s]), where step is
-    1 / N[s] (sample average, Section 2.4) when alpha is None, or the constant
-    alpha (Section 2.5), which weights recent catches more and so can follow
-    the change of Season 3.
+    Update, after catching R at spot a (incremental form, Section 2.3):
+        N(a) <- N(a) + 1
+        Q(a) <- Q(a) + step * (R - Q(a))
+    with step = 1 / N(a) if alpha is None: Q is the sample average (eq. 2.1);
+    or step = alpha (constant step size, Section 2.4): Q is an exponential
+    recency-weighted average, which forgets old catches. Useful in Season 3,
+    where the averages change on day 16.
 
-    Parameters:
-    - epsilon: exploration probability, between 0 and 1.
-    - alpha: None for sample averages, or a constant step size in (0, 1].
-    - initial_value: starting Q of every spot. A value above any possible
-      average (for example 15 kg) with epsilon 0 and a constant alpha is the
-      optimistic initial values method (Section 2.6). With sample averages the
-      first visit replaces the initial value, so optimism needs alpha.
+    Parameters
+    ----------
+    epsilon : float in [0, 1]
+        Probability of exploring.
+    alpha : float in (0, 1] or None
+        Constant step size, or None for sample averages.
+    q0 : float
+        Initial estimate Q1(a) of every spot. With sample averages it only
+        matters until the first visit. A large q0 is "optimistic" (Section 2.5).
     """
 
-    def __init__(self, epsilon=0.1, alpha=None, initial_value=0.0, n_spots=5, seed=None):
-        """Store the parameters.
-
-        Raises ValueError if epsilon or alpha is out of range.
-        """
+    def __init__(self, n_spots=5, seed=None, epsilon=0.1, alpha=None, q0=0.0):
         super().__init__(n_spots, seed)
-        check_probability("epsilon", epsilon)
-        check_step_size(alpha)
-        self.epsilon = epsilon
-        self.alpha = alpha
-        self.initial_value = initial_value
+        self.epsilon, self.alpha, self.q0 = epsilon, alpha, q0
 
     def reset(self):
-        """Set every estimate back to initial_value and every count to 0."""
-        self.q = np.full(self.n_spots, float(self.initial_value))
-        self.n = np.zeros(self.n_spots)
+        self.Q = np.full(self.n_spots, float(self.q0))
+        self.N = np.zeros(self.n_spots)
 
     def choose(self):
-        """Explore with probability epsilon, otherwise exploit the best estimate."""
         if self.rng.random() < self.epsilon:
-            return int(self.rng.integers(self.n_spots))
-        return argmax_random_tie(self.q, self.rng)
+            return int(self.rng.integers(self.n_spots))  # explore
+        return _argmax_random_tie(self.Q, self.rng)       # exploit
 
     def update(self, spot, catch):
-        """Move the estimate of spot towards the catch."""
-        incremental_update(self.q, self.n, spot, catch, self.alpha)
+        self.N[spot] += 1
+        step = 1.0 / self.N[spot] if self.alpha is None else self.alpha
+        self.Q[spot] += step * (catch - self.Q[spot])
+
+
+class OptimisticGreedyAgent(EpsilonGreedyAgent):
+    """Optimistic initial values (Section 2.5): greedy (epsilon = 0) with a large q0.
+
+    Every spot starts with Q = q0 (15 kg, above any realistic average: the true
+    averages are between 2 and 10 kg). Each catch is "disappointing", so Q of
+    the visited spot drops below the untried ones and the agent tries every
+    spot early. Exploration is driven by the initial values, not by chance.
+
+    With sample averages (alpha=None, our default) q0 is forgotten at the
+    first visit: the agent tries each spot once, then is greedy. With a
+    constant step size `alpha` the optimism fades away slowly (weight
+    (1 - alpha)^N on q0, eq. 2.6), so spots are re-tried several times.
+    """
+
+    def __init__(self, n_spots=5, seed=None, q0=15.0, alpha=None):
+        super().__init__(n_spots, seed, epsilon=0.0, alpha=alpha, q0=q0)
 
 
 class UCBAgent(Agent):
-    """Upper-confidence-bound action selection (Sutton and Barto, Section 2.7).
+    """Upper-Confidence-Bound action selection (Section 2.6, eq. 2.8).
 
-    Memory: an estimate Q and a visit count N for each spot, and the day t.
+    Memory: Q, N as in EpsilonGreedyAgent, and t, the number of days fished.
 
-    Choice: a spot never visited first (chosen at random among them). Once
-    every spot has been visited, the spot with the highest
-    Q[s] + c * sqrt(ln(t) / N[s]), where t is today's day number (1, 2, ...).
-    The bonus is large for spots visited rarely, so they get re-tested.
+    Choice: any spot never tried first (N(a) = 0 counts as a maximizing
+    action); then
+        A = argmax_a  Q(a) + c * sqrt( ln(t) / N(a) )
+    The square-root term measures the uncertainty of Q(a): it shrinks when a
+    is tried and grows slowly when other spots are tried. So UCB explores the
+    spots that might be the best, not uniformly as epsilon-greedy does.
 
-    Update: as in EpsilonGreedyAgent, a sample average (alpha None) or a
-    constant step size alpha.
-
-    Parameters:
-    - c: exploration strength in kg, at least 0. Catches have a noise
-      standard deviation of 2.5 kg, so useful values are of that order.
-    - alpha: None for sample averages, or a constant step size in (0, 1].
+    Parameters
+    ----------
+    c : float > 0
+        Degree of exploration. The bonus is in kg, so c must be of the order
+        of the catch noise (standard deviation 2.5 kg): c = 0 is pure greedy.
+    alpha : float or None
+        Constant step size for Q (Section 2.4) or None for sample averages.
+        A constant alpha (e.g. 0.5) makes Q follow the change of Season 3:
+        after the change, the catches of a spot that collapsed quickly pull
+        its Q down, instead of being averaged with 15 good days.
     """
 
-    def __init__(self, c=2.0, alpha=None, n_spots=5, seed=None):
-        """Store the parameters.
-
-        Raises ValueError if c is negative or alpha is out of range.
-        """
+    def __init__(self, n_spots=5, seed=None, c=2.0, alpha=None):
         super().__init__(n_spots, seed)
-        if c < 0:
-            raise ValueError(f"c must be at least 0, got {c}")
-        check_step_size(alpha)
-        self.c = c
-        self.alpha = alpha
+        self.c, self.alpha = c, alpha
 
     def reset(self):
-        """Forget the estimates, the counts and the day."""
-        self.q = np.zeros(self.n_spots)
-        self.n = np.zeros(self.n_spots)
+        self.Q = np.zeros(self.n_spots)
+        self.N = np.zeros(self.n_spots)
         self.t = 0
 
     def choose(self):
-        """Visit untried spots first, then maximise the upper confidence bound."""
-        untried = self.n == 0
-        if untried.any():
-            return argmax_random_tie(untried, self.rng)
-        day = self.t + 1
-        bound = self.q + self.c * np.sqrt(np.log(day) / self.n)
-        return argmax_random_tie(bound, self.rng)
+        untried = np.flatnonzero(self.N == 0)
+        if untried.size:                         # N(a) = 0: a is maximizing
+            return int(self.rng.choice(untried))
+        bonus = self.c * np.sqrt(np.log(self.t) / self.N)
+        return _argmax_random_tie(self.Q + bonus, self.rng)
 
     def update(self, spot, catch):
-        """Move the estimate of spot towards the catch and count the day."""
         self.t += 1
-        incremental_update(self.q, self.n, spot, catch, self.alpha)
+        self.N[spot] += 1
+        step = 1.0 / self.N[spot] if self.alpha is None else self.alpha
+        self.Q[spot] += step * (catch - self.Q[spot])
+
+# ===========================================================================
+# Task 6 (optional, Part IV): contextual agents
+# ===========================================================================
+#
+# The conditions x = [wind_kmh, waves_m, tide_m] are first scaled to [0, 1]
+# (dividing by 40, 3 and 2, their maximal values) so that the three features
+# have the same scale for KNN distances and for the ridge penalty. A constant
+# 1 is added for the intercept of the linear regression.
+
+_X_SCALE = np.array([40.0, 3.0, 2.0])
 
 
-# Task 6 (optional): add your contextual agents below, as subclasses of
-# ContextualAgent.
+def _features(x):
+    """[1, wind/40, waves/3, tide/2]: intercept + conditions scaled to [0, 1]."""
+    return np.concatenate(([1.0], np.asarray(x, dtype=float) / _X_SCALE))
 
 
-class LinearRegressionAgent(ContextualAgent):
-    """Predicts each spot's catch from the conditions with linear regression.
+class ContextualWrapper(ContextualAgent):
+    """Lets a Part III Agent play a ContextualBay by ignoring the conditions x.
 
-    Model: for each spot s, catch ~ theta_s . z with z = [1, wind / 40,
-    waves / 3, tide / 2]. The divisors are feature_scale, the maximum of each
-    condition stated in the fishing.py notes, so all features lie in [0, 1].
-
-    Memory: for each spot, A_s = ridge * I + sum of z z^T and b_s = sum of
-    z * catch over the days fished there. theta_s = A_s^-1 b_s is the ridge
-    least-squares fit. A spot with no data has theta_s = 0, so its prediction
-    is 0 kg.
-
-    Choice: with probability epsilon a spot chosen uniformly at random.
-    Otherwise the spot with the highest score theta_s . z + bonus * width_s,
-    where width_s = sqrt(z^T A_s^-1 z) is large when spot s has few
-    observations in conditions like today's (ties broken at random).
-
-    With epsilon 0 and bonus 0 the agent acts only on its predictions. On
-    day 1 every prediction is 0, so it picks a random spot. That spot then
-    predicts a positive catch while unvisited spots stay at 0, so the agent
-    can lock onto it for the whole season. Two fixes:
-    - epsilon > 0: random days keep every spot sampled (Section 2.2 idea).
-    - bonus > 0: an upper confidence bound on the prediction, the
-      contextual form of UCB (Section 2.7), known as LinUCB. Spots and
-      conditions that were rarely observed get tested, others do not.
-
-    Parameters:
-    - epsilon: exploration probability, between 0 and 1.
-    - bonus: weight of the confidence width, at least 0.
-    - ridge: regularisation strength, above 0. Keeps A_s invertible before a
-      spot has 4 observations.
-    - feature_scale: the divisor of each condition.
+    Used to compare the best agent of Part III with the contextual agents on
+    the same bays (play() refuses an Agent on a ContextualBay).
     """
 
-    def __init__(self, epsilon=0.0, bonus=0.0, ridge=1.0,
-                 feature_scale=(40.0, 3.0, 2.0), n_spots=5, seed=None):
-        """Store the parameters.
-
-        Raises ValueError if epsilon is out of range, bonus is negative,
-        ridge is not positive, or feature_scale does not hold 3 positive numbers.
-        """
+    def __init__(self, agent, n_spots=5, seed=None):
         super().__init__(n_spots, seed)
-        check_probability("epsilon", epsilon)
-        if bonus < 0:
-            raise ValueError(f"bonus must be at least 0, got {bonus}")
-        if ridge <= 0:
-            raise ValueError(f"ridge must be above 0, got {ridge}")
-        scale = np.asarray(feature_scale, dtype=float)
-        if scale.shape != (3,) or np.any(scale <= 0):
-            raise ValueError("feature_scale must hold 3 positive numbers")
-        self.epsilon = epsilon
-        self.bonus = bonus
-        self.ridge = ridge
-        self.feature_scale = scale
-
-    def reset(self):
-        """Forget every observation: A_s back to ridge * I and b_s to 0."""
-        dim = len(self.feature_scale) + 1
-        self.a = np.stack([self.ridge * np.eye(dim) for _ in range(self.n_spots)])
-        self.b = np.zeros((self.n_spots, dim))
-
-    def _features(self, x):
-        """The feature vector z = [1, x / feature_scale] of conditions x."""
-        return np.concatenate(([1.0], np.asarray(x, dtype=float) / self.feature_scale))
-
-    def predict(self, x):
-        """Predicted catch of every spot for conditions x (array of n_spots)."""
-        z = self._features(x)
-        theta = np.linalg.solve(self.a, self.b[:, :, None])[:, :, 0]
-        return theta @ z
-
-    def confidence_width(self, x):
-        """sqrt(z^T A_s^-1 z) of every spot for conditions x (array of n_spots)."""
-        z = self._features(x)
-        a_inv_z = np.linalg.solve(self.a, np.tile(z, (self.n_spots, 1))[:, :, None])[:, :, 0]
-        return np.sqrt(a_inv_z @ z)
-
-    def choose(self, x):
-        """Explore with probability epsilon, otherwise the best score."""
-        if self.rng.random() < self.epsilon:
-            return int(self.rng.integers(self.n_spots))
-        score = self.predict(x)
-        if self.bonus > 0:
-            score = score + self.bonus * self.confidence_width(x)
-        return argmax_random_tie(score, self.rng)
-
-    def update(self, x, spot, catch):
-        """Add the observation (x, catch) to the regression of spot."""
-        z = self._features(x)
-        self.a[spot] += np.outer(z, z)
-        self.b[spot] += catch * z
-
-
-class ContextFreeAgent(ContextualAgent):
-    """Plays a Part III agent on the contextual bay, ignoring the conditions.
-
-    Used to compare the contextual agents with the best agent of Part III.
-    Memory and choices are those of the wrapped agent, which never sees x.
-
-    Parameter: agent, an instance of a subclass of Agent.
-    """
-
-    def __init__(self, agent):
-        """Wrap agent. Raises TypeError if it is not an Agent."""
-        if not isinstance(agent, Agent):
-            raise TypeError("agent must be an instance of Agent")
-        super().__init__(agent.n_spots)
         self.agent = agent
 
     def reset(self):
-        """Reset the wrapped agent."""
         self.agent.reset()
 
     def choose(self, x):
-        """The wrapped agent's choice. The conditions x are ignored."""
         return self.agent.choose()
 
     def update(self, x, spot, catch):
-        """Pass the spot and catch to the wrapped agent. x is ignored."""
         self.agent.update(spot, catch)
+
+
+class LinearRegressionAgent(ContextualAgent):
+    """Predicts the catch of each spot with a linear regression on x, then picks the best.
+
+    Memory, for each spot k (ridge regression, updated online):
+        A_k = lam * I + sum of phi phi^T     over the days spot k was fished
+        b_k = sum of catch * phi
+    with phi = _features(x). The prediction is phi^T theta_k, theta_k = A_k^-1 b_k.
+    Linear regression fits this simulator well: the hidden average catch of a
+    spot is linear in the scaled conditions (clipped at 0).
+
+    Choice:
+    1. Warm-up: until every spot has been fished `warmup` times, fish the
+       least tried spot (a regression needs data).
+    2. Then, with probability `epsilon` a random spot, otherwise the spot with
+       the largest predicted catch for today's conditions.
+
+    epsilon = 0 is "acting only on the predictions" (the failing case of
+    Task 6); epsilon > 0 is the epsilon-greedy fix (Section 2.2).
+
+    Parameters
+    ----------
+    lam : float
+        Ridge penalty: keeps theta defined with fewer than 4 samples.
+    warmup : int
+        Samples of each spot collected before trusting the predictions.
+    epsilon : float
+        Exploration probability after the warm-up.
+    """
+
+    def __init__(self, n_spots=5, seed=None, lam=1.0, warmup=1, epsilon=0.0):
+        super().__init__(n_spots, seed)
+        self.lam, self.warmup, self.epsilon = lam, warmup, epsilon
+
+    def reset(self):
+        d = 4                                            # 1 + 3 features
+        self.A = np.array([self.lam * np.eye(d) for _ in range(self.n_spots)])
+        self.b = np.zeros((self.n_spots, d))
+        self.N = np.zeros(self.n_spots)
+
+    def predict(self, x):
+        """Predicted catch of every spot for conditions x (array of length n_spots)."""
+        phi = _features(x)
+        return np.array([phi @ np.linalg.solve(self.A[k], self.b[k]) for k in range(self.n_spots)])
+
+    def choose(self, x):
+        if self.N.min() < self.warmup:                   # 1. warm-up
+            return _argmax_random_tie(-self.N, self.rng)
+        if self.rng.random() < self.epsilon:             # 2a. explore
+            return int(self.rng.integers(self.n_spots))
+        return _argmax_random_tie(self.predict(x), self.rng)  # 2b. best prediction
+
+    def update(self, x, spot, catch):
+        phi = _features(x)
+        self.A[spot] += np.outer(phi, phi)
+        self.b[spot] += catch * phi
+        self.N[spot] += 1
+
+
+class LinUCBAgent(LinearRegressionAgent):
+    """Fix for "acting only on predictions": UCB (Section 2.6) on the linear regression.
+
+    Same model as LinearRegressionAgent, but the score of spot k is
+        phi^T theta_k + c * sqrt(phi^T A_k^-1 phi)
+    The second term is the uncertainty of the prediction for TODAY's
+    conditions: it is large for a spot rarely fished, or never fished in
+    conditions like today's. It plays the role of sqrt(ln t / N(a)) in eq. 2.8,
+    so a spot that looked bad after a few unlucky days is still re-tried, and
+    the exploration is aimed at the conditions where we know little.
+    (This is the LinUCB algorithm of Li et al., 2010.)
+
+    Parameters
+    ----------
+    c : float
+        Exploration strength (kg per unit of prediction standard error).
+        c = 5 was the best of {1, 2.5, 5} on held-out tuning bays.
+    """
+
+    def __init__(self, n_spots=5, seed=None, lam=1.0, c=5.0):
+        super().__init__(n_spots, seed, lam=lam, warmup=1, epsilon=0.0)
+        self.c = c
+
+    def choose(self, x):
+        if self.N.min() < self.warmup:
+            return _argmax_random_tie(-self.N, self.rng)
+        phi = _features(x)
+        scores = np.empty(self.n_spots)
+        for k in range(self.n_spots):
+            A_inv_phi = np.linalg.solve(self.A[k], phi)
+            theta = np.linalg.solve(self.A[k], self.b[k])
+            scores[k] = phi @ theta + self.c * np.sqrt(phi @ A_inv_phi)
+        return _argmax_random_tie(scores, self.rng)
+
+
+class KNNAgent(ContextualAgent):
+    """Predicts the catch of each spot with K-nearest neighbours on x.
+
+    Memory: for each spot, the list of (scaled conditions, catch) of the days
+    it was fished.
+
+    Prediction for spot k and today's conditions: average catch of the `k`
+    past days at spot k whose scaled conditions are closest (Euclidean
+    distance) to today's. With fewer than `k` days, the average of all of them.
+    Unlike the linear regression, KNN assumes nothing about the shape of the
+    relation, but needs more data and predicts badly in rarely seen conditions.
+
+    Choice: warm-up (`warmup` days per spot), then epsilon-greedy on the
+    predictions, as LinearRegressionAgent.
+    """
+
+    def __init__(self, n_spots=5, seed=None, k=10, warmup=3, epsilon=0.0):
+        super().__init__(n_spots, seed)
+        self.k, self.warmup, self.epsilon = k, warmup, epsilon
+
+    def reset(self):
+        self.X = [[] for _ in range(self.n_spots)]   # scaled conditions per spot
+        self.y = [[] for _ in range(self.n_spots)]   # catches per spot
+
+    def predict(self, x):
+        z = np.asarray(x, dtype=float) / _X_SCALE
+        pred = np.empty(self.n_spots)
+        for s in range(self.n_spots):
+            X, y = np.array(self.X[s]), np.array(self.y[s])
+            nearest = np.argsort(np.linalg.norm(X - z, axis=1))[: self.k]
+            pred[s] = y[nearest].mean()
+        return pred
+
+    def choose(self, x):
+        counts = np.array([len(v) for v in self.y])
+        if counts.min() < self.warmup:
+            return _argmax_random_tie(-counts, self.rng)
+        if self.rng.random() < self.epsilon:
+            return int(self.rng.integers(self.n_spots))
+        return _argmax_random_tie(self.predict(x), self.rng)
+
+    def update(self, x, spot, catch):
+        self.X[spot].append(np.asarray(x, dtype=float) / _X_SCALE)
+        self.y[spot].append(catch)
